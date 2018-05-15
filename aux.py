@@ -17,7 +17,6 @@ def orthogonal_initializer(scale=1.0):
         return tf.constant(orthogonal(shape) * scale, dtype)
     return _initializer
 
-
 def layer_norm_all(h, base, num_units, scope):
     # Layer Norm (faster version)
     #
@@ -75,8 +74,8 @@ def zoneout(new_h, new_c, h, c, h_keep, c_keep, is_training):
     mask_c = tf.nn.dropout(mask_c, c_keep)
     mask_h = tf.nn.dropout(mask_h, h_keep)
 
-  mask_c *= c_keep
-  mask_h *= h_keep
+  #mask_c *= c_keep
+  #mask_h *= h_keep
 
   h = new_h * mask_h + (-mask_h + 1.) * h
   c = new_c * mask_c + (-mask_c + 1.) * c

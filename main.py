@@ -60,10 +60,9 @@ class PTBModel(object):
         vocab_size = config.vocab_size
 
         emb_init = aux.orthogonal_initializer(1.0)
-        with tf.device("/cpu:0"):
-            embedding = tf.get_variable(
-                "embedding", [vocab_size, emb_size], initializer=emb_init, dtype=tf.float32)
-            inputs = tf.nn.embedding_lookup(embedding, input_.input_data)
+        embedding = tf.get_variable(
+            "embedding", [vocab_size, emb_size], initializer=emb_init, dtype=tf.float32)
+        inputs = tf.nn.embedding_lookup(embedding, input_.input_data)
 
         F_cells = [LNLSTM.LN_LSTMCell(F_size, use_zoneout=True, is_training=is_training,
                                       zoneout_keep_h=config.zoneout_h, zoneout_keep_c=config.zoneout_c)
