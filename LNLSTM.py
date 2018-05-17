@@ -1,5 +1,6 @@
 import tensorflow as tf
 import aux
+from gumbel_softmax import *
 
 class LN_LSTMCell(tf.contrib.rnn.RNNCell):
     """
