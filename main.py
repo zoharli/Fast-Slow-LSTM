@@ -67,12 +67,14 @@ class PTBModel(object):
         F_cells = [LNLSTM.LN_LSTMCell(F_size, use_zoneout=True, is_training=is_training,
                                       zoneout_keep_h=config.zoneout_h, zoneout_keep_c=config.zoneout_c)
                    for _ in range(config.fast_layers)]
-
-
-        S_cell  = LNLSTM.LN_LSTMCell(S_size, use_zoneout=True, is_training=is_training,
-                                     zoneout_keep_h=config.zoneout_h, zoneout_keep_c=config.zoneout_c)
+        F_cells[0] = LNLSTM.LN_MALSTMCell(config,F_size, use_zoneout=True, is_training=is_training,
+                                      zoneout_keep_h=config.zoneout_h, zoneout_keep_c=config.zoneout_c,use_i_mem=config.i_mem)
+        
+        S_cell  = LNLSTM.LN_MALSTMCell( config,S_size, use_zoneout=True, is_training=is_training,
+                                     zoneout_keep_h=config.zoneout_h, zoneout_keep_c=config.zoneout_c,use_h_mem=config.h_mem)
 
         FS_cell = FSRNN.FSRNNCell(F_cells, S_cell, config.keep_prob, is_training)
+        self.FS_cell=FS_cell
         self._initial_state = FS_cell.zero_state(batch_size, tf.float32)
         state = self._initial_state
 
@@ -122,6 +124,9 @@ class PTBModel(object):
 
     def assign_lr(self, session, lr_value):
         session.run(self._lr_update, feed_dict={self._new_lr: lr_value})
+
+    def set_tau(self,num):
+        self.FS_cell.set_tau(num)
 
     @property
     def input(self):
@@ -222,7 +227,7 @@ def main(_):
                                  input_=test_input)
 
         saver = tf.train.Saver(tf.trainable_variables())
-
+        tau=1.
         with tf.Session() as session:
             session.run(tf.global_variables_initializer())
             coord = tf.train.Coordinator()
@@ -234,11 +239,15 @@ def main(_):
                 m.assign_lr(session, config.learning_rate * lr_decay)
 
                 print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
+                m.set_tau(tau)
                 train_perplexity = run_epoch(session, m, eval_op=m.train_op, verbose=True)
                 print("Epoch: %d Train BPC: %.4f" % (i + 1, train_perplexity))
                 valid_perplexity = run_epoch(session, mvalid)
                 print("Epoch: %d Valid BPC: %.4f" % (i + 1, valid_perplexity))
                 sys.stdout.flush()
+
+                if tau<config.max_tau:
+                    tau+=config.step_tau
 
                 if i == 180: config.learning_rate *= 0.1
 

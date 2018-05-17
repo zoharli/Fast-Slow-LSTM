@@ -80,8 +80,8 @@ class LN_MALSTMCell(tf.contrib.rnn.RNNCell):
     https://github.com/hardmaru/supercell
     """
 
-    def __init__(self, config, num_units, f_bias=1.0, use_zoneout=False,
-                 zoneout_keep_h = 0.9, zoneout_keep_c = 0.5, is_training = False):
+    def __init__(self, config, input_size,num_units, f_bias=1.0, use_zoneout=False,
+                 zoneout_keep_h = 0.9, zoneout_keep_c = 0.5, is_training = False,use_i_mem=False,use_h_mem=False):
         """Initialize the Layer Norm LSTM cell.
         Args:
           num_units: int, The number of units in the LSTM cell.
@@ -90,6 +90,7 @@ class LN_MALSTMCell(tf.contrib.rnn.RNNCell):
           dropout_keep_prob: float, dropout keep probability (default 0.90)
         """
         self.config=config
+        self.input_size=input_size
         self.num_units = num_units
         self.f_bias = f_bias
 
@@ -98,25 +99,94 @@ class LN_MALSTMCell(tf.contrib.rnn.RNNCell):
         self.zoneout_keep_c = zoneout_keep_c
 
         self.is_training = is_training
+        self.use_i_mem=use_i_mem
+        self.use_h_mem=use_h_mem
 
-    def __call__(self, x, state, scope=None):
+        self.memcnt=0
+        self.tau=1.
+
+        mode=config.mode
+        if mode=='train':
+            batch_size=config.batch_size
+        elif mode=='val':
+            batch_size=config.val_batch_size
+        elif mode=='test':
+            batch_size=config.test_batch_size
+        self.batch_size=batch_size 
+        if self.i_mem:
+            self.i_auxcell = LN_LSTMCell(config.head_size+1,use_zoneout=True,is_training=is_training)
+        if self.h_mem:
+            self.h_auxcell = LN_LSTMCell(config.head_size+1,use_zoneout=True,is_training=is_training)
+
+        self.i_mem=None
+        self.h_mem=None
+
+
+    def _reset_mem(self):
+        self.memcnt=0
+        if self.use_i_mem:
+            self.i_mem=tf.zeros(self.batch_size,self.mem_cap,self.input_size)
+            self.i_last_use=tf.ones(self.batch_size,self.mem_cap)*-9999999.)
+        if self.use_h_mem:
+            self.h_mem=tf.zeros(self.batch_size,self.mem_cap,self.num_units)
+            self.h_last_use=tf.ones(self.batch_size,self.mem_cap)*-9999999.)
+
+    def set_tau(self,num):
+        self.tau=num
+
+    def write(self,entry,index,mem,scope=None):
+        with tf.name_scope(scope):
+            ones=tf.expand_dims(index,axis=2)
+            mem=entry.unsqueeze(1)*ones+mem*(1.-ones)
+            return mem
+
+    def read(self,x,h,last_use,ux_state,cell,mem,scope=None):
+        with tf.variable_scope(scope):
+            read_key,new_aux_state=cell(tf.concat(axis=1,values=[x,h]),aux_state)
+            assert len(read_head.shape)==2
+            read_key,time=tf.split(read_key,[self.head_size,1],axis=1)
+            read_key=tf.expand_dims(read_key,axis=1)
+            key=tf.contrib.layers.legacy_fully_connected(tf.stop_gradient(mem),config.head_size//2)
+            key=tf.contrib.layers.legacy_fully_connected(key,config.head_size,tf.sigmoid)
+            read_head=1/(1e-8+tf.sqrt(tf.reduce_sum((read_key-key)**2,axis=2)+self.config.time_fac*(time-last_use)**2))
+            index=gumbel_softmax(read_head,self.tau)
+            entry=tf.reduce_sum(tf.expand_dims(index,axis=2)*mem,axis=1)
+        return entry,index,new_aux_state
+
+    def __call__(self, x, state, aux_state=(None,None),scope=None):
         with tf.variable_scope(scope or type(self).__name__):
+            x0=x
             h, c = state
-
+            h_detach=tf.stop_grad(h)
+            x_detach=tf.stop_grad(x)
+            i_aux_state=aux_state[0]
+            h_aux_state=aux_state[1]
+            
             h_size = self.num_units
             x_size = x.get_shape().as_list()[1]
-
+            
             w_init = aux.orthogonal_initializer(1.0)
             h_init = aux.orthogonal_initializer(1.0)
             b_init = tf.constant_initializer(0.0)
 
             W_xh = tf.get_variable('W_xh',
-                                   [x_size, 4 * h_size], initializer=w_init, dtype=tf.float32)
+                                   [x_size if self.i_mem else 2*x_size, 4 * h_size], initializer=w_init, dtype=tf.float32)
             W_hh = tf.get_variable('W_hh',
-                                   [h_size, 4 * h_size], initializer=h_init, dtype=tf.float32)
+                                   [h_size if self.h_mem else 2*h_size, 4 * h_size], initializer=h_init, dtype=tf.float32)
             bias = tf.get_variable('bias', [4 * h_size], initializer=b_init, dtype=tf.float32)
-
-            key
+            
+            i_new_aux_state=None
+            if self.use_i_mem:
+                i_entry,i_index,i_new_aux_state=self.read(x_detach,h_detach,self.i_last_use,i_aux_state,i_auxcell,self.i_mem,scope='i_read')
+                x=tf.concat(axis=1,values=[x,i_entry])       
+                self.i_last_use-=1
+                self.i_last_use-=self.i_last_use*i_index
+            h_new_aux_state=None
+            if self.use_h_mem:
+                h_entry,h_index,h_new_aux_state=self.read(x_detach,h_detach,self.h_last_use,h_aux_state,h_auxcell,self.h_mem,scope='h_read')
+                h=tf.concat(axis=1,values=[h,h_entry])
+                self.h_last_use-=1
+                self.h_last_use-=self.h_last_use*h_index
 
             concat = tf.concat(axis=1, values=[x, h])  # concat for speed.
             W_full = tf.concat(axis=0, values=[W_xh, W_hh])
@@ -132,141 +202,23 @@ class LN_MALSTMCell(tf.contrib.rnn.RNNCell):
             if self.use_zoneout:
                 new_h, new_c = aux.zoneout(new_h, new_c, h, c, self.zoneout_keep_h,
                                            self.zoneout_keep_c, self.is_training)
-
-        return new_h, (new_h, new_c)
+            
+            if self.memcnt<self.memcap:
+                h_write_index=i_write_index=tf.expand_dims(tf.concat(axis=0,values=[torch.zeros([self.memcnt]),tf.ones([1]),tf.zeros([self.memcap-1-self.memcnt])]),axis=0)
+                self.memcnt+=1
+            else:
+                h_write_index=h_index if self.use_h_mem else None
+                i_write_index=i_index if self.use_i_mem else None
+            if self.use_i_mem:
+                self.i_mem=self.write(x0,i_write_index,scope='i_write')
+            if self.use_h_mem:
+                self.h_mem=self.write(new_h,h_write_index,scope='h_write')
+            
+        return new_h, (new_h, new_c),(i_new_aux_state,h_new_aux_state)
 
     def zero_state(self, batch_size, dtype):
         h = tf.zeros([batch_size, self.num_units], dtype=dtype)
         c = tf.zeros([batch_size, self.num_units], dtype=dtype)
-        return (h, c)
-class MALSTMCell(nn.Module):
-
-    def __init__(self,options,input_size, hidden_size, use_bias=True):
-        super().__init__()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.use_bias = use_bias
-        self.time_fac=options['time_fac']
-        self.weight_ih = nn.Parameter(torch.FloatTensor(2*input_size, 3 * hidden_size))
-        self.weight_hh = nn.Parameter(torch.FloatTensor(2*hidden_size, 3 * hidden_size))
-        self.bias_ih = nn.Parameter(torch.FloatTensor(1,3 * hidden_size))
-        self.bias_hh = nn.Parameter(torch.FloatTensor(1,3 * hidden_size))
-        self.memcnt=0
-        self.memcap=options['mem_cap']
-        self.head_size=options['head_size']
-        mode=options['mode']
-        if mode=='train':
-            batch_size=options['batch_size']
-        elif mode=='val':
-            batch_size=options['eval_batch_size']
-        elif mode=='test':
-            batch_size=options['test_batch_size']
-        self.batch_size=batch_size 
-        self.auxcell = GRUCell(input_size+hidden_size,2*(self.head_size+1))
-        self.tau=1.
-        self.i_fc=nn.Sequential(
-                nn.Linear(input_size,self.head_size//2),
-                nn.ReLU(),
-                nn.Linear(self.head_size//2,self.head_size),
-                nn.Sigmoid())  
-        self.h_fc=nn.Sequential(
-                nn.Linear(hidden_size,self.head_size//2),
-                nn.ReLU(),
-                nn.Linear(self.head_size//2,self.head_size),
-                nn.Sigmoid())
-        
-        self.last_usage=None
-        self.mem=None
-
-        self.reset_parameters()
-    
-    def _reset_mem(self):
-        self.memcnt=0
-        self.imem=Variable(torch.zeros(self.batch_size,self.memcap,self.input_size),requires_grad=True).cuda()
-        self.hmem=Variable(torch.zeros(self.batch_size,self.memcap,self.hidden_size),requires_grad=True).cuda()
-        self.i_last_use=Variable(torch.ones(self.batch_size,self.memcap)*-9999999.).cuda()
-        self.h_last_use=Variable(torch.ones(self.batch_size,self.memcap)*-9999999.).cuda()
-
-    def __repr__(self):
-        s = '{name}({input_size}, {hidden_size})'
-        return s.format(name=self.__class__.__name__, **self.__dict__)
-
-    def set_tau(self,num):
-        self.tau=num
-
-    def reset_parameters(self):
-        """
-        Initialize parameters following the way proposed in the paper.
-        """
-        stdv = 1.0 / math.sqrt(self.hidden_size)
-        for n,p in self.named_parameters():
-            if 'weight' in n:
-                nn.init.orthogonal_(p)
-            if 'bias' in n:
-                nn.init.constant_(p.data, val=0)
-        
-    def forward(self, input_, h_0, aux_h_0):
-
-        i=input_
-        h=h_0.detach()
-        read_head=self.auxcell(torch.cat([i,h],dim=1),aux_h_0) 
-        i_read_head,h_read_head=torch.split(read_head,self.head_size+1,dim=1)
-        i_head_vecs=torch.cat([self.i_fc(self.imem.detach()),self.time_fac*torch.sigmoid(self.i_last_use).detach().unsqueeze(2)],dim=2)
-        h_head_vecs=torch.cat([self.h_fc(self.hmem.detach()),self.time_fac*torch.sigmoid(self.h_last_use).detach().unsqueeze(2)],dim=2)
-        i_read_head=1/torch.sqrt((1e-6+(i_read_head.unsqueeze(1)-i_head_vecs)**2).sum(dim=2))
-        h_read_head=1/torch.sqrt((1e-6+(h_read_head.unsqueeze(1)-h_head_vecs)**2).sum(dim=2))
-        i_entry,i_read_index,h_entry,h_read_index=self.read(i_read_head,h_read_head,self.tau)
-        self.i_last_use.add_(-1).add_(-self.i_last_use*i_read_index)
-        self.h_last_use.add_(-1).add_(-self.h_last_use*h_read_index)
-        
-        new_i=torch.cat([input_,i_entry],dim=1)
-        new_h0=torch.cat([h_0,h_entry],dim=1)
-        wi_b = torch.addmm(self.bias_ih, new_i, self.weight_ih)
-        wh_b = torch.addmm(self.bias_hh, new_h0, self.weight_hh)
-        ri,zi,ni=torch.split(wi_b,self.hidden_size,dim=1)
-        rh,zh,nh=torch.split(wh_b,self.hidden_size,dim=1)
-        r=torch.sigmoid(ri+rh)
-        z=torch.sigmoid(zi+zh)
-        n=torch.tanh(ni+r*nh)
-        h_1=(1-z)*n+z*h_0
-        
-        if self.memcnt<self.memcap:
-            h_write_index=i_write_index=Variable(torch.cat([torch.zeros(self.memcnt),torch.ones(1),torch.zeros(self.memcap-1-self.memcnt)]).unsqueeze(0)).cuda()
-            self.memcnt+=1
-        else:
-            h_write_index=h_read_index
-            i_write_index=i_read_index
-        self.write(input_,i_write_index,h_0,h_write_index)
-        
-        return h_1,read_head
-
-    def write(self,i,i_index,h,h_index):
-        i_ones=i_index.unsqueeze(2)
-        h_ones=h_index.unsqueeze(2)
-        self.imem=i.unsqueeze(1)*i_ones+self.imem*(1.-i_ones)
-        self.hmem=h.unsqueeze(1)*h_ones+self.hmem*(1.-h_ones)
-
-    def read(self,i_read_head,h_read_head,tau):
-        i_index,_=self.gumbel_softmax(i_read_head,tau)
-        h_index,_=self.gumbel_softmax(h_read_head,tau)
-        i_entry=i_index.unsqueeze(2)*self.imem
-        h_entry=h_index.unsqueeze(2)*self.hmem
-        i_entry=i_entry.sum(dim=1)
-        h_entry=h_entry.sum(dim=1)
-        return i_entry,i_index,h_entry,h_index
-
-    def gumbel_softmax(self,input, tau):
-            gumbel = Variable(-torch.log(1e-20-torch.log(1e-20+torch.rand(*input.shape)))).cuda()
-            y=torch.nn.functional.softmax((torch.log(1e-20+input)+gumbel)*tau,dim=1)
-            ymax,pos=y.max(dim=1)
-            hard_y=torch.eq(y,ymax.unsqueeze(1)).float()
-            y=(hard_y-y).detach()+y
-            return y,pos
-
-    def gumbel_sigmoid(self,input, tau):
-            gumbel = Variable(-torch.log(1e-20-torch.log(1e-20+torch.rand(*input.shape)))).cuda()
-            y=torch.sigmoid((input+gumbel)*tau)
-            #hard_y=torch.eq(y,ymax.unsqueeze(1)).float()
-            #y=(hard_y-y).detach()+y
-            return y
-
+        aux_h = tf.zeros([batch_size, self.head_size+1], dtype=dtype)
+        aux_c = tf.zeros([batch_size, self.head_size+1], dtype=dtype)
+        return ((h, c),((aux_h,aux_c) if self.use_i_mem else None,(aux_h,aux_c) if slef.use_h_mem else None))

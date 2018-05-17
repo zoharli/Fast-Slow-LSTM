@@ -49,3 +49,13 @@ class ptb_config(object):
     vocab_size = 50
     fast_layers = 2
     dataset = 'ptb'
+
+    "-----mem config-------"
+    time_fac=10
+    mem_cap=128
+    head_size=64
+    max_tau=mem_cap-1
+    step_tau=5
+    h_mem=False
+    i_mem=True
+    
